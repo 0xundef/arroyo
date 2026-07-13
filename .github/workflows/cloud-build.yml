@@ -25,8 +25,8 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install build deps (protoc, pkg-config)
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config
+      - name: Install build deps (protoc, pkg-config, curl/ssl headers for librdkafka)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libcurl4-openssl-dev libssl-dev
 
       - name: Configure cargo cache
         uses: Swatinem/rust-cache@v2
