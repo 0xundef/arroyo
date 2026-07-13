@@ -1,0 +1,47 @@
+name: Cloud Build (arroyo, linux)
+
+# Build only the `arroyo` binary (release) for Linux x86_64 and upload it as an
+# artifact. Minimal vs binaries.yml — no postgres/frontend/python — enough to
+# run `arroyo run` against a streaming SQL pipeline on a cloud VPS.
+#
+# Trigger:  Actions tab → "Run workflow" (workflow_dispatch), or push to a
+# branch ending in _build (e.g. cloud_build).
+# Linux x86_64 runners are free for public repos and billed 1x for private
+# (so even private forks can use this within the free minute quota).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '*_build'
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps (protoc, pkg-config)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config
+
+      - name: Configure cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arroyo-linux-x86_64
+
+      - name: Build arroyo (release)
+        run: cargo build --release --package arroyo
+
+      - name: Strip binary
+        run: strip target/release/arroyo
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: arroyo-linux-x86_64
+          path: target/release/arroyo
+          if-no-files-found: error
