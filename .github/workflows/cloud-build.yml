@@ -1,13 +1,16 @@
 name: Cloud Build (arroyo, linux)
 
-# Build only the `arroyo` binary (release) for Linux x86_64 and upload it as an
-# artifact. Minimal vs binaries.yml — no postgres/frontend/python — enough to
-# run `arroyo run` against a streaming SQL pipeline on a cloud VPS.
+# Build only the `arroyo` binary (release) for Linux x86_64 and upload it.
+# Mirrors binaries.yml's required pre-build setup (postgres + refinery
+# migrations) but on the FREE standard ubuntu-22.04 runner, no Python, no
+# frontend build (empty webui/dist → no UI, but `arroyo run` works).
+#
+# Why postgres at build time: crates/arroyo-api/build.rs runs cornucopia
+# codegen against a live Postgres schema, so the DB + migrations must exist
+# before `cargo build`.
 #
 # Trigger:  Actions tab → "Run workflow" (workflow_dispatch), or push to a
-# branch ending in _build (e.g. cloud_build).
-# Linux x86_64 runners are free for public repos and billed 1x for private
-# (so even private forks can use this within the free minute quota).
+# branch ending in _build.
 
 on:
   workflow_dispatch:
@@ -15,9 +18,27 @@ on:
     branches:
       - '*_build'
 
+env:
+  REFINERY_CONFIG: postgres://arroyo:arroyo@localhost:5432/arroyo
+  REFINERY_VERSION: 0.8.14
+  DATABASE_URL: postgres://arroyo:arroyo@localhost:5432/arroyo
+
 jobs:
   build-linux:
     runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:14.13-alpine3.20
+        env:
+          POSTGRES_USER: arroyo
+          POSTGRES_PASSWORD: arroyo
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -32,6 +53,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: arroyo-linux-x86_64
+
+      - name: Install refinery CLI and run DB migrations
+        run: |
+          cargo install --debug refinery_cli --version $REFINERY_VERSION
+          refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
+
+      - name: Stub webui/dist (rust-embed requires the folder to exist; empty = no UI)
+        run: mkdir -p webui/dist
 
       - name: Build arroyo (release)
         run: cargo build --release --package arroyo
