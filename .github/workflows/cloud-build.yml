@@ -1,9 +1,9 @@
 name: Cloud Build (arroyo, linux)
 
-# Build only the `arroyo` binary (release) for Linux x86_64 and upload it.
-# Mirrors binaries.yml's required pre-build setup (postgres + refinery
-# migrations) but on the FREE standard ubuntu-22.04 runner, no Python, no
-# frontend build (empty webui/dist → no UI, but `arroyo run` works).
+# Build the `arroyo` binary (release) for Linux x86_64, WITH the webui frontend
+# (vite build -> webui/dist, embedded by rust-embed so the binary serves the
+# console). No Python feature. Mirrors binaries.yml's pre-build setup (postgres
+# + refinery migrations) but on the FREE ubuntu-22.04 runner.
 #
 # Why postgres at build time: crates/arroyo-api/build.rs runs cornucopia
 # codegen against a live Postgres schema, so the DB + migrations must exist
@@ -59,8 +59,16 @@ jobs:
           cargo install --debug refinery_cli --version $REFINERY_VERSION
           refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
 
-      - name: Stub webui/dist (rust-embed requires the folder to exist; empty = no UI)
-        run: mkdir -p webui/dist
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.7.1
+      - name: Build webui (vite -> dist, embedded into the binary by rust-embed)
+        run: cd webui && pnpm install && pnpm build
 
       - name: Build arroyo (release)
         run: cargo build --release --package arroyo
