@@ -1,0 +1,122 @@
+name: Deploy to claw2 (single-node arroyo cluster)
+
+# Builds nothing — pulls the arroyo binary from the latest successful cloud-build
+# run, SSHes into claw2 (public IP), installs runtime deps + systemd unit, starts
+# `arroyo cluster` (single-node: api+compiler+controller+embedded worker), waits for
+# the API, then registers the lz_pipeline.sql (no UDF — works without cargo on claw2).
+#
+# Prereq: repo secret CLAW2_SSH_KEY = contents of ~/.ssh/claw.pem (private key).
+#
+# Trigger:  Actions tab → "Run workflow" (workflow_dispatch).
+
+on:
+  workflow_dispatch:
+
+env:
+  CLAW2_HOST: 124.156.225.146
+  CLAW2_USER: ubuntu
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Download arroyo binary from latest cloud-build
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: cloud-build.yml
+          workflow_conclusion: success
+          name: arroyo-linux-x86_64
+          path: bin
+          search_artifacts: true
+
+      - name: Prepare payload
+        run: |
+          chmod +x bin/arroyo
+          ls -lh bin/arroyo lz_pipeline.sql
+
+      - name: Set up SSH agent
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.CLAW2_SSH_KEY }}
+
+      - name: Trust claw2 host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$CLAW2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Install runtime deps on claw2 (libcurl4, ca-certificates)
+        run: |
+          ssh "$CLAW2_USER@$CLAW2_HOST" \
+            'sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4 ca-certificates jq >/dev/null 2>&1 && echo deps-ok'
+
+      - name: Upload binary + SQL
+        run: |
+          ssh "$CLAW2_USER@$CLAW2_HOST" 'mkdir -p ~/arroyo'
+          scp -O bin/arroyo lz_pipeline.sql "$CLAW2_USER@$CLAW2_HOST:~/arroyo/"
+
+      - name: Write systemd unit (locally)
+        run: |
+          cat > /tmp/arroyo.service <<UNIT
+          [Unit]
+          Description=Arroyo single-node cluster (api+compiler+controller+worker)
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          User=${CLAW2_USER}
+          WorkingDirectory=/home/${CLAW2_USER}/arroyo
+          ExecStart=/home/${CLAW2_USER}/arroyo/arroyo cluster
+          Restart=always
+          RestartSec=5
+          Environment=RUST_LOG=info
+          Environment=ARROYO__CHECKPOINT_URL=/home/${CLAW2_USER}/arroyo/state
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          cat /tmp/arroyo.service
+
+      - name: Install systemd unit + (re)start arroyo cluster
+        run: |
+          scp -O /tmp/arroyo.service "$CLAW2_USER@$CLAW2_HOST:/tmp/arroyo.service"
+          ssh "$CLAW2_USER@$CLAW2_HOST" \
+            'sudo install -m 644 /tmp/arroyo.service /etc/systemd/system/arroyo.service && \
+             sudo systemctl daemon-reload && \
+             sudo systemctl enable --now arroyo && \
+             sudo systemctl restart arroyo'
+
+      - name: Wait for API (:5115)
+        run: |
+          for i in $(seq 1 40); do
+            if ssh "$CLAW2_USER@$CLAW2_HOST" 'curl -sf http://localhost:5115/api/v1/ping' 2>/dev/null | grep -qi pong; then
+              echo "API up after $((i*3))s"; exit 0
+            fi
+            sleep 3
+          done
+          echo "API did not come up; journalctl tail:"; \
+          ssh "$CLAW2_USER@$CLAW2_HOST" 'sudo journalctl -u arroyo --no-pager -n 40'
+          exit 1
+
+      - name: Register lz_pipeline.sql (no UDF; idempotent delete-then-create)
+        run: |
+          BODY=$(jq -n --arg q "$(cat lz_pipeline.sql)" \
+            '{name:"lz-raw", query:$q, parallelism:1}')
+          # delete any existing lz-raw pipeline, then create fresh
+          ssh "$CLAW2_USER@$CLAW2_HOST" bash -s <<'REMOTE'
+            set -e
+            for id in $(curl -s http://localhost:5115/api/v1/pipelines | jq -r '.data[]? | select(.name=="lz-raw") | .id'); do
+              curl -s -X DELETE "http://localhost:5115/api/v1/pipelines/$id" >/dev/null
+            done
+          REMOTE
+          echo "creating pipeline lz-raw..."
+          ssh "$CLAW2_USER@$CLAW2_HOST" "curl -s -X POST http://localhost:5115/api/v1/pipelines -H 'content-type: application/json' -d '$BODY'" | tee /tmp/create.json
+          echo ""
+          echo "pipeline id: $(jq -r .id /tmp/create.json // 'none')"
+
+      - name: Status
+        run: |
+          ssh "$CLAW2_USER@$CLAW2_HOST" 'sudo systemctl --no-pager status arroyo | head -12 || true'
+          echo "--- pipelines ---"
+          ssh "$CLAW2_USER@$CLAW2_HOST" 'curl -s http://localhost:5115/api/v1/pipelines | jq -r ".data[]? | {id,name,state}"'
