@@ -55,7 +55,12 @@ jobs:
       - name: Upload binary
         run: |
           ssh "$CLAW2_USER@$CLAW2_HOST" 'mkdir -p ~/arroyo'
-          scp -O bin/arroyo "$CLAW2_USER@$CLAW2_HOST:~/arroyo/"
+          # scp to a temp name then mv: writing in-place fails with
+          # "Text file busy" (ETXTBSY) while arroyo.service is running it,
+          # but rename() swaps the directory entry and the running process
+          # keeps the old inode.
+          scp -O bin/arroyo "$CLAW2_USER@$CLAW2_HOST:~/arroyo/arroyo.new"
+          ssh "$CLAW2_USER@$CLAW2_HOST" 'mv -f ~/arroyo/arroyo.new ~/arroyo/arroyo && chmod +x ~/arroyo/arroyo'
 
       - name: Write systemd unit (locally)
         run: |
