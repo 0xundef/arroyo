@@ -35,7 +35,7 @@ jobs:
       - name: Prepare payload
         run: |
           chmod +x bin/arroyo
-          ls -lh bin/arroyo lz_pipeline.sql
+          ls -lh bin/arroyo lz_decoded.sql udfs/decode_packets.rs
 
       - name: Set up SSH agent
         uses: webfactory/ssh-agent@v0.9.1
@@ -52,10 +52,10 @@ jobs:
           ssh "$CLAW2_USER@$CLAW2_HOST" \
             'sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4 ca-certificates jq >/dev/null 2>&1 && echo deps-ok'
 
-      - name: Upload binary + SQL
+      - name: Upload binary
         run: |
           ssh "$CLAW2_USER@$CLAW2_HOST" 'mkdir -p ~/arroyo'
-          scp -O bin/arroyo lz_pipeline.sql "$CLAW2_USER@$CLAW2_HOST:~/arroyo/"
+          scp -O bin/arroyo "$CLAW2_USER@$CLAW2_HOST:~/arroyo/"
 
       - name: Write systemd unit (locally)
         run: |
@@ -99,24 +99,37 @@ jobs:
           ssh "$CLAW2_USER@$CLAW2_HOST" 'sudo journalctl -u arroyo --no-pager -n 40'
           exit 1
 
-      - name: Register lz_pipeline.sql (no UDF; idempotent delete-then-create)
+      - name: Build pipeline body (lz_decoded.sql + decode_packets UDF, inline)
         run: |
-          BODY=$(jq -n --arg q "$(cat lz_pipeline.sql)" \
-            '{name:"lz-raw", query:$q, parallelism:1}')
-          # delete any existing lz-raw pipeline, then create fresh
+          jq -n --arg q "$(cat lz_decoded.sql)" \
+            --arg d "$(cat udfs/decode_packets.rs)" \
+            '{name:"lz-decoded", query:$q, parallelism:1, udfs:[{definition:$d, language:"rust"}]}' \
+            > /tmp/lz_decoded_body.json
+          ls -lh /tmp/lz_decoded_body.json
+
+      - name: Upload pipeline body
+        run: scp -O /tmp/lz_decoded_body.json "$CLAW2_USER@$CLAW2_HOST:/tmp/lz_decoded_body.json"
+
+      - name: Register lz-decoded (idempotent stop-delete-then-create)
+        run: |
           ssh "$CLAW2_USER@$CLAW2_HOST" bash -s <<'REMOTE'
             set -e
-            for id in $(curl -s http://localhost:5115/api/v1/pipelines | jq -r '.data[]? | select(.name=="lz-raw") | .id'); do
-              curl -s -X DELETE "http://localhost:5115/api/v1/pipelines/$id" >/dev/null
+            # stop + delete any existing lz-decoded (deletion requires terminal job state)
+            for id in $(curl -s http://localhost:5115/api/v1/pipelines | jq -r '.data[]? | select(.name=="lz-decoded") | .id'); do
+              curl -s -X PATCH "http://localhost:5115/api/v1/pipelines/$id" -H 'content-type: application/json' -d '{"stop":"immediate"}' >/dev/null || true
             done
+            sleep 5
+            for id in $(curl -s http://localhost:5115/api/v1/pipelines | jq -r '.data[]? | select(.name=="lz-decoded") | .id'); do
+              curl -s -X DELETE "http://localhost:5115/api/v1/pipelines/$id" >/dev/null || true
+            done
+            echo "creating pipeline lz-decoded..."
+            curl -s -X POST http://localhost:5115/api/v1/pipelines -H 'content-type: application/json' -d @/tmp/lz_decoded_body.json | jq -c '{id:.id,name:.name}'
           REMOTE
-          echo "creating pipeline lz-raw..."
-          ssh "$CLAW2_USER@$CLAW2_HOST" "curl -s -X POST http://localhost:5115/api/v1/pipelines -H 'content-type: application/json' -d '$BODY'" | tee /tmp/create.json
-          echo ""
-          echo "pipeline id: $(jq -r .id /tmp/create.json // 'none')"
 
       - name: Status
         run: |
           ssh "$CLAW2_USER@$CLAW2_HOST" 'sudo systemctl --no-pager status arroyo | head -12 || true'
           echo "--- pipelines ---"
-          ssh "$CLAW2_USER@$CLAW2_HOST" 'curl -s http://localhost:5115/api/v1/pipelines | jq -r ".data[]? | {id,name,state}"'
+          ssh "$CLAW2_USER@$CLAW2_HOST" 'curl -s http://localhost:5115/api/v1/pipelines | jq -r ".data[]? | {id,name}"'
+          echo "--- running jobs ---"
+          ssh "$CLAW2_USER@$CLAW2_HOST" 'curl -s http://localhost:5115/api/v1/jobs | jq -r ".data[]?|select(.state==\"Running\")|\"\(.id) \(.pipeline_id)\""'
